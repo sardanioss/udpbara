@@ -395,10 +395,9 @@ func (t *Tunnel) readLoop() {
 		keyBuf = append(keyBuf, sourceHost...)
 		keyBuf = append(keyBuf, ':')
 		keyBuf = strconv.AppendInt(keyBuf, int64(sourcePort), 10)
-		sourceKey := string(keyBuf)
 
 		t.connsMu.RLock()
-		conns := t.conns[sourceKey]
+		conns := t.conns[string(keyBuf)]
 		if len(conns) == 0 {
 			conns = t.allConns
 		}
