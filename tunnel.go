@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,7 +26,7 @@ type Tunnel struct {
 	mu         sync.Mutex
 	controlTCP net.Conn     // SOCKS5 control TCP connection
 	relayAddr  *net.UDPAddr // SOCKS5 relay UDP address
-	remoteUDP  *net.UDPConn // UDP socket to the SOCKS5 relay
+	remoteUDP  atomic.Pointer[net.UDPConn] // UDP socket to the SOCKS5 relay (atomic for lock-free hot path)
 
 	// Active connections keyed by address (both hostname and resolved IPs).
 	// Multiple keys can point to the same []*tunnelConn slice.
@@ -233,7 +234,7 @@ func (t *Tunnel) connectContext(ctx context.Context) error {
 
 	t.controlTCP = tcpConn
 	t.relayAddr = relayAddr
-	t.remoteUDP = remoteUDP
+	t.remoteUDP.Store(remoteUDP)
 
 	return nil
 }
@@ -338,8 +339,8 @@ func (t *Tunnel) Close() error {
 	t.connsMu.Unlock()
 
 	t.mu.Lock()
-	if t.remoteUDP != nil {
-		t.remoteUDP.Close()
+	if udp := t.remoteUDP.Load(); udp != nil {
+		udp.Close()
 	}
 	if t.controlTCP != nil {
 		t.controlTCP.Close()
@@ -352,6 +353,14 @@ func (t *Tunnel) Close() error {
 // readLoop continuously reads from the SOCKS5 relay and dispatches to connections.
 func (t *Tunnel) readLoop() {
 	buf := make([]byte, 65535)
+	// Pre-allocate key buffer to avoid fmt.Sprintf per packet
+	keyBuf := make([]byte, 0, 64)
+
+	udp := t.remoteUDP.Load()
+	if udp == nil {
+		return
+	}
+
 	for {
 		select {
 		case <-t.closeCh:
@@ -359,8 +368,8 @@ func (t *Tunnel) readLoop() {
 		default:
 		}
 
-		t.remoteUDP.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, err := t.remoteUDP.Read(buf)
+		udp.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, err := udp.Read(buf)
 		if err != nil {
 			if isTimeout(err) {
 				continue
@@ -381,21 +390,27 @@ func (t *Tunnel) readLoop() {
 		t.pktsRecv.Add(1)
 		t.bytesRecv.Add(uint64(len(payload)))
 
-		// Dispatch to matching connections by source address key.
-		// The SOCKS5 relay returns the actual server IP, so we try that first.
-		// If no match (e.g., DNS returned a different IP than we resolved),
-		// fall back to broadcasting to all connections on this tunnel.
-		sourceKey := fmt.Sprintf("%s:%d", sourceHost, sourcePort)
+		// Build source key without fmt.Sprintf allocation
+		keyBuf = keyBuf[:0]
+		keyBuf = append(keyBuf, sourceHost...)
+		keyBuf = append(keyBuf, ':')
+		keyBuf = strconv.AppendInt(keyBuf, int64(sourcePort), 10)
+		sourceKey := string(keyBuf)
+
 		t.connsMu.RLock()
 		conns := t.conns[sourceKey]
 		if len(conns) == 0 {
-			// Fallback: broadcast to all active connections
 			conns = t.allConns
 		}
-		for _, c := range conns {
-			pktCopy := make([]byte, len(payload))
-			copy(pktCopy, payload)
-			c.deliverPacket(pktCopy)
+		if len(conns) == 1 {
+			// Single connection — deliver directly without copy
+			conns[0].deliverPacket(payload)
+		} else {
+			for _, c := range conns {
+				pktCopy := make([]byte, len(payload))
+				copy(pktCopy, payload)
+				c.deliverPacket(pktCopy)
+			}
 		}
 		t.connsMu.RUnlock()
 	}
@@ -435,8 +450,8 @@ func (t *Tunnel) reconnect() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if t.remoteUDP != nil {
-		t.remoteUDP.Close()
+	if udp := t.remoteUDP.Load(); udp != nil {
+		udp.Close()
 	}
 	if t.controlTCP != nil {
 		t.controlTCP.Close()
