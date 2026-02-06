@@ -1,4 +1,4 @@
-module github.com/user/udpbara
+module github.com/sardanioss/udpbara
 
 go 1.25.5
 

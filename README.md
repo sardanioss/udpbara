@@ -60,7 +60,7 @@ No TUN interfaces. No root. No iptables. No kernel modules. Just pure userspace 
 ## Install
 
 ```bash
-go get github.com/user/udpbara
+go get github.com/sardanioss/udpbara
 ```
 
 ## Usage
@@ -68,7 +68,7 @@ go get github.com/user/udpbara
 ### Quick — One-Shot Dial
 
 ```go
-import "github.com/user/udpbara"
+import "github.com/sardanioss/udpbara"
 
 // Creates tunnel + connection in one call
 conn, err := udpbara.Dial("socks5h://user:pass@proxy:10000", "target.com:443")
