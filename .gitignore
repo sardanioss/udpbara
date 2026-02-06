@@ -1,0 +1,10 @@
+# Test files
+cmd/
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+poc
