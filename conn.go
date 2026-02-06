@@ -3,6 +3,7 @@ package udpbara
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,12 @@ type tunnelConn struct {
 	closeCh chan struct{}
 	closed  bool
 	closeMu sync.Mutex
+
+	// Per-connection stats
+	pktsSent  atomic.Uint64
+	pktsRecv  atomic.Uint64
+	bytesSent atomic.Uint64
+	bytesRecv atomic.Uint64
 }
 
 // newTunnelConn creates a tunnelConn with a local UDP socket pair.
@@ -94,6 +101,8 @@ func (c *tunnelConn) relayAppToProxy() {
 
 		if remoteUDP != nil {
 			remoteUDP.Write(pkt)
+			c.pktsSent.Add(1)
+			c.bytesSent.Add(uint64(n))
 			c.tunnel.pktsSent.Add(1)
 			c.tunnel.bytesSent.Add(uint64(n))
 		}
@@ -103,6 +112,8 @@ func (c *tunnelConn) relayAppToProxy() {
 // deliverPacket sends a packet from the proxy to the app-facing socket.
 func (c *tunnelConn) deliverPacket(payload []byte) {
 	c.relayConn.WriteToUDP(payload, c.appAddr)
+	c.pktsRecv.Add(1)
+	c.bytesRecv.Add(uint64(len(payload)))
 }
 
 // PacketConn returns the app-facing UDPConn that the caller should use.

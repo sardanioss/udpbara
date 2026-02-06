@@ -5,7 +5,17 @@
 // TUN interfaces, or system-wide routing changes.
 //
 // Each tunnel maintains a single SOCKS5 UDP ASSOCIATE session and can multiplex
-// multiple target destinations through the same proxy connection.
+// multiple target destinations through the same proxy connection. Connections
+// expose a real *net.UDPConn for full compatibility with quic-go (OOB/ECN support).
+//
+// Basic usage:
+//
+//	conn, err := udpbara.Dial("socks5h://user:pass@proxy:10000", "target.com:443")
+//	if err != nil { log.Fatal(err) }
+//	defer conn.Close()
+//
+//	transport := &quic.Transport{Conn: conn.PacketConn()}
+//	quicConn, err := transport.Dial(ctx, conn.RelayAddr(), tlsConfig, quicConfig)
 package udpbara
 
 import (
@@ -13,7 +23,20 @@ import (
 	"net/url"
 )
 
-// Config holds configuration for a tunnel.
+// Logger is an optional logging interface for tunnel events.
+// Implement this to integrate with your application's logging framework.
+type Logger interface {
+	// Debug logs a debug-level message (packet dispatch, connection registration).
+	Debug(msg string, args ...any)
+	// Info logs an info-level message (connect, disconnect, reconnect).
+	Info(msg string, args ...any)
+	// Error logs an error-level message (connection failures, protocol errors).
+	Error(msg string, args ...any)
+}
+
+// Config holds configuration for a tunnel. All fields have sensible defaults
+// via DefaultConfig(). Zero-value fields will not override defaults when passed
+// to NewTunnel or Dial — use DefaultConfig() and modify specific fields instead.
 type Config struct {
 	// ReadBufferSize is the UDP socket read buffer size in bytes.
 	// Default: 7MB (recommended for QUIC).
@@ -38,6 +61,10 @@ type Config struct {
 	// AutoReconnect enables automatic reconnection when the TCP control drops.
 	// Default: true.
 	AutoReconnect bool
+
+	// Logger is an optional logger for tunnel events.
+	// If nil, no logging is performed. Default: nil.
+	Logger Logger
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -52,8 +79,15 @@ func DefaultConfig() Config {
 	}
 }
 
-// ParseProxyURL parses a SOCKS5 proxy URL and returns components.
-// Accepted formats: socks5://user:pass@host:port, socks5h://user:pass@host:port
+// ParseProxyURL parses a SOCKS5 proxy URL and returns its components.
+// Accepted formats:
+//
+//	socks5://user:pass@host:port
+//	socks5h://user:pass@host:port
+//	socks5://host:port  (no auth)
+//
+// Both socks5 and socks5h schemes are accepted (udpbara always preserves
+// hostnames in SOCKS5 UDP headers regardless of scheme).
 func ParseProxyURL(proxyURL string) (addr, user, pass string, err error) {
 	u, err := url.Parse(proxyURL)
 	if err != nil {

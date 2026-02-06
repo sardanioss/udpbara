@@ -1,6 +1,7 @@
 package udpbara
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -9,8 +10,12 @@ import (
 )
 
 // Tunnel maintains a SOCKS5 UDP ASSOCIATE session through a single proxy.
-// It can create multiple connections for different targets,
-// all sharing the same proxy connection.
+// It can create multiple connections for different targets, all sharing the
+// same proxy connection and UDP relay.
+//
+// A Tunnel handles the full SOCKS5 lifecycle: TCP control connection,
+// authentication, UDP relay setup, packet dispatch, and automatic reconnection.
+// Use NewTunnel() to create, Connect() to establish, and Dial() to create connections.
 type Tunnel struct {
 	proxyAddr string
 	proxyUser string
@@ -32,6 +37,9 @@ type Tunnel struct {
 	running  atomic.Bool
 	closeCh  chan struct{}
 
+	// Logger (nil = no logging)
+	logger Logger
+
 	// Stats
 	pktsSent  atomic.Uint64
 	pktsRecv  atomic.Uint64
@@ -39,13 +47,17 @@ type Tunnel struct {
 	bytesRecv atomic.Uint64
 }
 
-// TunnelStats contains tunnel statistics.
-type TunnelStats struct {
+// Stats contains packet and byte counters. Used for both tunnel-level
+// and connection-level statistics.
+type Stats struct {
 	PacketsSent uint64
 	PacketsRecv uint64
 	BytesSent   uint64
 	BytesRecv   uint64
 }
+
+// TunnelStats is an alias for Stats for backward compatibility.
+type TunnelStats = Stats
 
 // Connection holds the resources for a single target connection through a tunnel.
 // Use PacketConn() to get the *net.UDPConn for quic-go, and RelayAddr() for the
@@ -66,9 +78,24 @@ func (c *Connection) RelayAddr() *net.UDPAddr {
 }
 
 // Tunnel returns the underlying Tunnel this connection belongs to.
-// Useful for accessing Stats() on connections created via the top-level Dial().
+// Useful for accessing tunnel-level Stats() on connections created via the top-level Dial().
 func (c *Connection) Tunnel() *Tunnel {
 	return c.conn.tunnel
+}
+
+// Target returns the target address this connection was dialed to (e.g., "example.com:443").
+func (c *Connection) Target() string {
+	return c.conn.target
+}
+
+// Stats returns per-connection packet and byte counters.
+func (c *Connection) Stats() Stats {
+	return Stats{
+		PacketsSent: c.conn.pktsSent.Load(),
+		PacketsRecv: c.conn.pktsRecv.Load(),
+		BytesSent:   c.conn.bytesSent.Load(),
+		BytesRecv:   c.conn.bytesRecv.Load(),
+	}
 }
 
 // Close shuts down this connection. If this Connection was created by the
@@ -99,13 +126,43 @@ func NewTunnel(proxyURL string, config ...Config) (*Tunnel, error) {
 		proxyUser: user,
 		proxyPass: pass,
 		config:    cfg,
+		logger:    cfg.Logger,
 		conns:     make(map[string][]*tunnelConn),
 		closeCh:   make(chan struct{}),
 	}, nil
 }
 
-// Connect establishes the SOCKS5 UDP ASSOCIATE session.
+// log helper methods — safe to call when logger is nil.
+func (t *Tunnel) logDebug(msg string, args ...any) {
+	if t.logger != nil {
+		t.logger.Debug(msg, args...)
+	}
+}
+
+func (t *Tunnel) logInfo(msg string, args ...any) {
+	if t.logger != nil {
+		t.logger.Info(msg, args...)
+	}
+}
+
+func (t *Tunnel) logError(msg string, args ...any) {
+	if t.logger != nil {
+		t.logger.Error(msg, args...)
+	}
+}
+
+// Connect establishes the SOCKS5 UDP ASSOCIATE session with the proxy.
+// This performs the TCP connection, SOCKS5 handshake, and UDP relay setup.
+// It is safe to call multiple times — subsequent calls are no-ops if already connected.
+// After Connect returns, call Dial() to create connections to targets.
 func (t *Tunnel) Connect() error {
+	return t.ConnectContext(context.Background())
+}
+
+// ConnectContext is like Connect but respects context cancellation and deadlines.
+// Returns context.DeadlineExceeded or context.Canceled if the context expires
+// before the connection is established.
+func (t *Tunnel) ConnectContext(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -113,7 +170,13 @@ func (t *Tunnel) Connect() error {
 		return nil
 	}
 
-	if err := t.connect(); err != nil {
+	// Check context before attempting connection
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if err := t.connectContext(ctx); err != nil {
+		t.logError("connect failed", "proxy", t.proxyAddr, "error", err)
 		return err
 	}
 
@@ -121,13 +184,22 @@ func (t *Tunnel) Connect() error {
 	go t.readLoop()
 	go t.monitorControl()
 
+	t.logInfo("tunnel connected", "proxy", t.proxyAddr, "relay", t.relayAddr)
 	return nil
 }
 
 // connect performs the actual SOCKS5 handshake and UDP ASSOCIATE.
 func (t *Tunnel) connect() error {
+	return t.connectContext(context.Background())
+}
+
+// connectContext performs the SOCKS5 handshake with context support.
+func (t *Tunnel) connectContext(ctx context.Context) error {
 	timeout := time.Duration(t.config.ConnectTimeout) * time.Second
-	tcpConn, err := net.DialTimeout("tcp", t.proxyAddr, timeout)
+
+	// Use context deadline if it's sooner than ConnectTimeout
+	dialer := &net.Dialer{Timeout: timeout}
+	tcpConn, err := dialer.DialContext(ctx, "tcp", t.proxyAddr)
 	if err != nil {
 		return fmt.Errorf("tcp connect: %w", err)
 	}
@@ -169,8 +241,18 @@ func (t *Tunnel) connect() error {
 // Dial creates a new connection through this tunnel to the specified target.
 // Returns a Connection with a real *net.UDPConn (fully compatible with quic-go).
 //
-// target format: "host:port" (e.g., "www.example.com:443")
+// The target format is "host:port" (e.g., "www.example.com:443"). Hostnames are
+// preserved in the SOCKS5 UDP header for proxy-side DNS resolution and auth.
+// The connection is also registered under resolved IP keys for response dispatch.
+//
+// Multiple connections to different targets can share the same tunnel.
 func (t *Tunnel) Dial(target string) (*Connection, error) {
+	return t.DialContext(context.Background(), target)
+}
+
+// DialContext is like Dial but respects context cancellation.
+// The context is used for DNS resolution of the target hostname.
+func (t *Tunnel) DialContext(ctx context.Context, target string) (*Connection, error) {
 	if !t.running.Load() {
 		return nil, fmt.Errorf("tunnel not connected")
 	}
@@ -191,8 +273,11 @@ func (t *Tunnel) Dial(target string) (*Connection, error) {
 
 	conn, err := newTunnelConn(t, target, socks5Header)
 	if err != nil {
+		t.logError("dial failed", "target", target, "error", err)
 		return nil, fmt.Errorf("create conn: %w", err)
 	}
+
+	t.logDebug("connection created", "target", target, "app", conn.PacketConn().LocalAddr(), "relay", conn.RelayAddr())
 
 	// Register under hostname:port key
 	t.connsMu.Lock()
@@ -202,10 +287,11 @@ func (t *Tunnel) Dial(target string) (*Connection, error) {
 	// Also register under resolved IP:port keys so readLoop can match
 	// SOCKS5 responses that come back with the server's actual IP.
 	if ip := net.ParseIP(host); ip == nil {
-		// host is a hostname, resolve it
-		if ips, err := net.LookupIP(host); err == nil {
+		// host is a hostname, resolve it using context
+		resolver := &net.Resolver{}
+		if ips, err := resolver.LookupIPAddr(ctx, host); err == nil {
 			for _, resolved := range ips {
-				ipKey := fmt.Sprintf("%s:%s", resolved.String(), portStr)
+				ipKey := fmt.Sprintf("%s:%s", resolved.IP.String(), portStr)
 				t.conns[ipKey] = append(t.conns[ipKey], conn)
 			}
 		}
@@ -231,6 +317,7 @@ func (t *Tunnel) Close() error {
 		return nil
 	}
 
+	t.logInfo("tunnel closing", "proxy", t.proxyAddr, "active_conns", len(t.allConns))
 	close(t.closeCh)
 
 	// Use allConns to close each connection exactly once (conns map has
@@ -332,8 +419,10 @@ func (t *Tunnel) monitorControl() {
 			}
 
 			if t.config.AutoReconnect && t.running.Load() {
+				t.logInfo("control connection dropped, reconnecting", "proxy", t.proxyAddr)
 				t.reconnect()
 			} else {
+				t.logInfo("control connection dropped, closing", "proxy", t.proxyAddr)
 				t.Close()
 			}
 			return
@@ -358,15 +447,19 @@ func (t *Tunnel) reconnect() {
 			return
 		}
 
+		t.logInfo("reconnect attempt", "attempt", attempt+1, "proxy", t.proxyAddr)
 		if err := t.connect(); err != nil {
+			t.logError("reconnect failed", "attempt", attempt+1, "error", err)
 			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 			continue
 		}
 
+		t.logInfo("reconnected successfully", "proxy", t.proxyAddr, "relay", t.relayAddr)
 		go t.readLoop()
 		go t.monitorControl()
 		return
 	}
 
+	t.logError("reconnect exhausted all attempts, tunnel shutting down", "proxy", t.proxyAddr)
 	t.running.Store(false)
 }
