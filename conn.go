@@ -67,7 +67,14 @@ func newTunnelConn(tunnel *Tunnel, target string, socks5Header []byte) (*tunnelC
 
 // relayAppToProxy reads from app, wraps in SOCKS5, sends to proxy.
 func (c *tunnelConn) relayAppToProxy() {
-	buf := make([]byte, 65535)
+	headerLen := len(c.socks5Header)
+	// Pre-allocate send buffer: [socks5Header | payload space]
+	// Header is pre-copied once; payload is written at offset headerLen each packet.
+	sendBuf := make([]byte, headerLen+65535)
+	copy(sendBuf, c.socks5Header)
+	// Read buffer starts after the header so payload lands in the right spot
+	readBuf := sendBuf[headerLen:]
+
 	for {
 		select {
 		case <-c.closeCh:
@@ -76,7 +83,7 @@ func (c *tunnelConn) relayAppToProxy() {
 		}
 
 		c.relayConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, _, err := c.relayConn.ReadFromUDP(buf)
+		n, _, err := c.relayConn.ReadFromUDP(readBuf)
 		if err != nil {
 			if isTimeout(err) {
 				continue
@@ -89,18 +96,10 @@ func (c *tunnelConn) relayAppToProxy() {
 			}
 		}
 
-		// Wrap payload with SOCKS5 header and send through tunnel
-		payload := buf[:n]
-		pkt := make([]byte, len(c.socks5Header)+len(payload))
-		copy(pkt, c.socks5Header)
-		copy(pkt[len(c.socks5Header):], payload)
-
-		c.tunnel.mu.Lock()
-		remoteUDP := c.tunnel.remoteUDP
-		c.tunnel.mu.Unlock()
-
+		// Lock-free atomic load instead of mutex
+		remoteUDP := c.tunnel.remoteUDP.Load()
 		if remoteUDP != nil {
-			remoteUDP.Write(pkt)
+			remoteUDP.Write(sendBuf[:headerLen+n])
 			c.pktsSent.Add(1)
 			c.bytesSent.Add(uint64(n))
 			c.tunnel.pktsSent.Add(1)
