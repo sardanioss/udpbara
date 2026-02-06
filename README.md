@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Userspace UDP relay for QUIC/HTTP3 through SOCKS5 proxies</b><br>
-  <i>Cuz UDP deserve to chill in tunnel too.</i>
+  <i>Cuz UDP deserves to chill in tunnel too.</i>
 </p>
 
 <p align="center">
