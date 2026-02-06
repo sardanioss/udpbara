@@ -125,37 +125,6 @@ defer conn.Close()
 mgr.CloseAll()
 ```
 
-### With HTTP/3 (quic-go + httpcloak)
-
-```go
-// Set up tunnel
-tunnel, _ := udpbara.NewTunnel(proxyURL)
-tunnel.Connect()
-defer tunnel.Close()
-
-conn, _ := tunnel.Dial("example.com:443")
-defer conn.Close()
-
-// QUIC transport using udpbara's real UDPConn
-quicTransport := &quic.Transport{
-    Conn: conn.PacketConn(),
-}
-defer quicTransport.Close()
-
-// HTTP/3 with custom dial through the relay
-relayAddr := conn.RelayAddr()
-h3Transport := &http3.Transport{
-    TLSClientConfig: tlsConfig,
-    QUICConfig:      quicConfig,
-    Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-        return quicTransport.DialEarly(ctx, relayAddr, tlsCfg, cfg)
-    },
-}
-defer h3Transport.Close()
-
-resp, err := h3Transport.RoundTrip(req)
-```
-
 ## API
 
 ### Top-Level
