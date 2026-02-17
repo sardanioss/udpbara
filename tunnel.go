@@ -272,6 +272,20 @@ func (t *Tunnel) DialContext(ctx context.Context, target string) (*Connection, e
 
 	socks5Header := buildSOCKS5UDPHeader(host, port)
 
+	// Resolve DNS before creating the conn or acquiring the lock.
+	// DNS failure is non-fatal: the conn still works via hostname key
+	// and allConns broadcast fallback in readLoop.
+	var resolvedKeys []string
+	if ip := net.ParseIP(host); ip == nil {
+		resolver := &net.Resolver{}
+		if ips, err := resolver.LookupIPAddr(ctx, host); err == nil {
+			resolvedKeys = make([]string, 0, len(ips))
+			for _, resolved := range ips {
+				resolvedKeys = append(resolvedKeys, fmt.Sprintf("%s:%s", resolved.IP.String(), portStr))
+			}
+		}
+	}
+
 	conn, err := newTunnelConn(t, target, socks5Header)
 	if err != nil {
 		t.logError("dial failed", "target", target, "error", err)
@@ -280,22 +294,18 @@ func (t *Tunnel) DialContext(ctx context.Context, target string) (*Connection, e
 
 	t.logDebug("connection created", "target", target, "app", conn.PacketConn().LocalAddr(), "relay", conn.RelayAddr())
 
-	// Register under hostname:port key
+	// Register under hostname:port key, allConns, and resolved IP keys.
+	// Critical section is just map writes — no I/O.
 	t.connsMu.Lock()
+	if !t.running.Load() {
+		t.connsMu.Unlock()
+		conn.Close()
+		return nil, fmt.Errorf("tunnel not connected")
+	}
 	t.conns[target] = append(t.conns[target], conn)
 	t.allConns = append(t.allConns, conn)
-
-	// Also register under resolved IP:port keys so readLoop can match
-	// SOCKS5 responses that come back with the server's actual IP.
-	if ip := net.ParseIP(host); ip == nil {
-		// host is a hostname, resolve it using context
-		resolver := &net.Resolver{}
-		if ips, err := resolver.LookupIPAddr(ctx, host); err == nil {
-			for _, resolved := range ips {
-				ipKey := fmt.Sprintf("%s:%s", resolved.IP.String(), portStr)
-				t.conns[ipKey] = append(t.conns[ipKey], conn)
-			}
-		}
+	for _, ipKey := range resolvedKeys {
+		t.conns[ipKey] = append(t.conns[ipKey], conn)
 	}
 	t.connsMu.Unlock()
 
