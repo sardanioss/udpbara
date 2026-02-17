@@ -127,11 +127,13 @@ func (c *tunnelConn) RelayAddr() *net.UDPAddr {
 }
 
 // Close cleans up both sockets and deregisters from tunnel.
+//
+// Lock ordering: closeMu is released before acquiring connsMu to prevent
+// deadlock with Tunnel.Close() which acquires connsMu → closeMu.
 func (c *tunnelConn) Close() error {
 	c.closeMu.Lock()
-	defer c.closeMu.Unlock()
-
 	if c.closed {
+		c.closeMu.Unlock()
 		return nil
 	}
 	c.closed = true
@@ -139,8 +141,11 @@ func (c *tunnelConn) Close() error {
 
 	c.appConn.Close()
 	c.relayConn.Close()
+	c.closeMu.Unlock()
 
-	// Deregister from tunnel (remove from all key entries and allConns)
+	// Deregister from tunnel (remove from all key entries and allConns).
+	// Safe without closeMu: the closed flag prevents re-entry, so this
+	// block runs at most once per tunnelConn.
 	c.tunnel.connsMu.Lock()
 	for key, conns := range c.tunnel.conns {
 		for i, tc := range conns {

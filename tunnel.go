@@ -318,12 +318,12 @@ func (t *Tunnel) Close() error {
 		return nil
 	}
 
-	t.logInfo("tunnel closing", "proxy", t.proxyAddr, "active_conns", len(t.allConns))
 	close(t.closeCh)
 
 	// Use allConns to close each connection exactly once (conns map has
 	// duplicate entries under hostname and IP keys).
 	t.connsMu.Lock()
+	t.logInfo("tunnel closing", "proxy", t.proxyAddr, "active_conns", len(t.allConns))
 	for _, c := range t.allConns {
 		c.closeMu.Lock()
 		if !c.closed {
