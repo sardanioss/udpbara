@@ -289,7 +289,13 @@ func (t *Tunnel) DialContext(ctx context.Context, target string) (*Connection, e
 		if ips, err := resolver.LookupIPAddr(ctx, host); err == nil {
 			resolvedKeys = make([]string, 0, len(ips))
 			for _, resolved := range ips {
-				resolvedKeys = append(resolvedKeys, fmt.Sprintf("%s:%s", resolved.IP.String(), portStr))
+				// Normalize IPv4-mapped IPv6 to plain IPv4 so keys match those
+				// produced by parseSOCKS5UDPPacket when a proxy responds with ATYP=0x01.
+				ip := resolved.IP
+				if v4 := ip.To4(); v4 != nil {
+					ip = v4
+				}
+				resolvedKeys = append(resolvedKeys, fmt.Sprintf("%s:%s", ip.String(), portStr))
 			}
 		}
 	}

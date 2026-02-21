@@ -188,7 +188,14 @@ func parseSOCKS5UDPPacket(data []byte) (payload []byte, sourceHost string, sourc
 		if len(data) < offset+16+2 {
 			return nil, "", 0, errors.New("too short for IPv6")
 		}
-		sourceHost = net.IP(data[offset : offset+16]).String()
+		ip := net.IP(data[offset : offset+16])
+		// Normalize IPv4-mapped IPv6 (::ffff:1.2.3.4) to plain IPv4 so dispatch
+		// keys match those registered under ATYP=0x01 or resolved IPv4 addresses.
+		if v4 := ip.To4(); v4 != nil {
+			sourceHost = v4.String()
+		} else {
+			sourceHost = ip.String()
+		}
 		offset += 16
 	case 0x03:
 		dlen := int(data[offset])
