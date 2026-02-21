@@ -166,6 +166,14 @@ func (c *tunnelConn) Close() error {
 			break
 		}
 	}
+	// Compact allConns when it's using more than 4x the space it needs,
+	// preventing unbounded memory growth in long-lived tunnels with many
+	// short-lived connections.
+	if n := len(c.tunnel.allConns); cap(c.tunnel.allConns) > 16 && n <= cap(c.tunnel.allConns)/4 {
+		fresh := make([]*tunnelConn, n)
+		copy(fresh, c.tunnel.allConns)
+		c.tunnel.allConns = fresh
+	}
 	c.tunnel.connsMu.Unlock()
 
 	return nil
