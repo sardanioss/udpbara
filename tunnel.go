@@ -164,79 +164,87 @@ func (t *Tunnel) Connect() error {
 // Returns context.DeadlineExceeded or context.Canceled if the context expires
 // before the connection is established.
 func (t *Tunnel) ConnectContext(ctx context.Context) error {
+	// Check under lock first — fast path if already connected.
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.running.Load() {
+		t.mu.Unlock()
 		return nil
 	}
-
-	// Check context before attempting connection
 	if err := ctx.Err(); err != nil {
+		t.mu.Unlock()
 		return err
 	}
+	t.mu.Unlock()
 
-	if err := t.connectContext(ctx); err != nil {
+	// Perform all network IO without holding t.mu. TCP dial + SOCKS5 handshake
+	// can block for up to ConnectTimeout seconds; Close() and monitorControl()
+	// must not be starved for the full duration.
+	ctrl, relayAddr, remoteUDP, err := t.doConnect(ctx)
+	if err != nil {
 		t.logError("connect failed", "proxy", t.proxyAddr, "error", err)
 		return err
 	}
 
+	// Store results under lock. Re-check running in case a concurrent
+	// ConnectContext beat us here.
+	t.mu.Lock()
+	if t.running.Load() {
+		t.mu.Unlock()
+		ctrl.Close()
+		remoteUDP.Close()
+		return nil
+	}
+	t.controlTCP = ctrl
+	t.relayAddr = relayAddr
+	t.remoteUDP.Store(remoteUDP)
 	t.running.Store(true)
+	t.mu.Unlock()
+
 	go t.readLoop()
 	go t.monitorControl()
-
-	t.logInfo("tunnel connected", "proxy", t.proxyAddr, "relay", t.relayAddr)
+	t.logInfo("tunnel connected", "proxy", t.proxyAddr, "relay", relayAddr)
 	return nil
 }
 
-// connect performs the actual SOCKS5 handshake and UDP ASSOCIATE.
-func (t *Tunnel) connect() error {
-	return t.connectContext(context.Background())
-}
-
-// connectContext performs the SOCKS5 handshake with context support.
-func (t *Tunnel) connectContext(ctx context.Context) error {
+// doConnect performs the TCP dial, SOCKS5 handshake, and UDP associate without
+// touching any Tunnel fields. The caller is responsible for closing ctrl and
+// remoteUDP on error or if the results are discarded.
+func (t *Tunnel) doConnect(ctx context.Context) (ctrl net.Conn, relayAddr *net.UDPAddr, remoteUDP *net.UDPConn, err error) {
 	timeout := time.Duration(t.config.ConnectTimeout) * time.Second
-
-	// Use context deadline if it's sooner than ConnectTimeout
 	dialer := &net.Dialer{Timeout: timeout}
-	tcpConn, err := dialer.DialContext(ctx, "tcp", t.proxyAddr)
+	ctrl, err = dialer.DialContext(ctx, "tcp", t.proxyAddr)
 	if err != nil {
-		return fmt.Errorf("tcp connect: %w", err)
+		return nil, nil, nil, fmt.Errorf("tcp connect: %w", err)
 	}
 
 	if t.config.TCPKeepAlive {
-		if tc, ok := tcpConn.(*net.TCPConn); ok {
+		if tc, ok := ctrl.(*net.TCPConn); ok {
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(time.Duration(t.config.TCPKeepAlivePeriod) * time.Second)
 		}
 	}
 
-	if err := socks5Handshake(tcpConn, t.proxyUser, t.proxyPass); err != nil {
-		tcpConn.Close()
-		return fmt.Errorf("socks5 handshake: %w", err)
+	if err = socks5Handshake(ctrl, t.proxyUser, t.proxyPass); err != nil {
+		ctrl.Close()
+		return nil, nil, nil, fmt.Errorf("socks5 handshake: %w", err)
 	}
 
-	relayAddr, err := socks5UDPAssociate(tcpConn)
+	relayAddr, err = socks5UDPAssociate(ctrl)
 	if err != nil {
-		tcpConn.Close()
-		return fmt.Errorf("udp associate: %w", err)
+		ctrl.Close()
+		return nil, nil, nil, fmt.Errorf("udp associate: %w", err)
 	}
 
-	remoteUDP, err := net.DialUDP("udp", nil, relayAddr)
+	remoteUDP, err = net.DialUDP("udp", nil, relayAddr)
 	if err != nil {
-		tcpConn.Close()
-		return fmt.Errorf("udp dial: %w", err)
+		ctrl.Close()
+		return nil, nil, nil, fmt.Errorf("udp dial: %w", err)
 	}
 
 	remoteUDP.SetReadBuffer(t.config.ReadBufferSize)
 	remoteUDP.SetWriteBuffer(t.config.WriteBufferSize)
 
-	t.controlTCP = tcpConn
-	t.relayAddr = relayAddr
-	t.remoteUDP.Store(remoteUDP)
-
-	return nil
+	return ctrl, relayAddr, remoteUDP, nil
 }
 
 // Dial creates a new connection through this tunnel to the specified target.
@@ -492,19 +500,33 @@ func (t *Tunnel) reconnect() {
 
 		t.logInfo("reconnect attempt", "attempt", attempt+1, "proxy", t.proxyAddr)
 
-		// Hold t.mu only for the duration of connect(), which writes
-		// controlTCP, relayAddr, and remoteUDP. Double-check running
-		// inside the lock to handle a Close() that raced the check above.
+		// Double-check running inside the lock before releasing for IO.
 		t.mu.Lock()
 		if !t.running.Load() {
 			t.mu.Unlock()
 			return
 		}
-		err := t.connect()
 		t.mu.Unlock()
 
+		// IO outside the lock — TCP dial + SOCKS5 handshake must not hold t.mu.
+		ctrl, relayAddr, remoteUDP, err := t.doConnect(context.Background())
+
 		if err == nil {
-			t.logInfo("reconnected successfully", "proxy", t.proxyAddr, "relay", t.relayAddr)
+			// Store results under lock. If Close() raced and set running=false,
+			// discard the freshly created resources.
+			t.mu.Lock()
+			if !t.running.Load() {
+				t.mu.Unlock()
+				ctrl.Close()
+				remoteUDP.Close()
+				return
+			}
+			t.controlTCP = ctrl
+			t.relayAddr = relayAddr
+			t.remoteUDP.Store(remoteUDP)
+			t.mu.Unlock()
+
+			t.logInfo("reconnected successfully", "proxy", t.proxyAddr, "relay", relayAddr)
 			go t.readLoop()
 			// monitorControl is not re-spawned here — the existing goroutine
 			// loops back after reconnect() returns and picks up the new controlTCP.
