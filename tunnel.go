@@ -430,15 +430,10 @@ func (t *Tunnel) readLoop() {
 		if len(conns) == 0 {
 			conns = t.allConns
 		}
-		if len(conns) == 1 {
-			// Single connection — deliver directly without copy
-			conns[0].deliverPacket(payload)
-		} else {
-			for _, c := range conns {
-				pktCopy := make([]byte, len(payload))
-				copy(pktCopy, payload)
-				c.deliverPacket(pktCopy)
-			}
+		for _, c := range conns {
+			pktCopy := make([]byte, len(payload))
+			copy(pktCopy, payload)
+			c.deliverPacket(pktCopy)
 		}
 		t.connsMu.RUnlock()
 	}
