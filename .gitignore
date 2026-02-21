@@ -8,3 +8,6 @@ cmd/
 *.so
 *.dylib
 poc
+
+# Local notes
+BUGS.md
