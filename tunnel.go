@@ -426,6 +426,9 @@ func (t *Tunnel) readLoop() {
 }
 
 // monitorControl watches the TCP control connection for drops.
+// It owns its own lifetime: after a successful reconnect it loops back
+// and picks up the new controlTCP rather than spawning a new goroutine,
+// which prevents goroutine duplication and the data race on t.controlTCP.
 func (t *Tunnel) monitorControl() {
 	buf := make([]byte, 1)
 	for {
@@ -435,8 +438,14 @@ func (t *Tunnel) monitorControl() {
 		default:
 		}
 
-		t.controlTCP.SetReadDeadline(time.Now().Add(30 * time.Second))
-		_, err := t.controlTCP.Read(buf)
+		// Copy controlTCP under lock to avoid a data race with reconnect(),
+		// which replaces t.controlTCP while holding t.mu.
+		t.mu.Lock()
+		ctrl := t.controlTCP
+		t.mu.Unlock()
+
+		ctrl.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_, err := ctrl.Read(buf)
 		if err != nil {
 			if isTimeout(err) {
 				continue
@@ -445,10 +454,11 @@ func (t *Tunnel) monitorControl() {
 			if t.config.AutoReconnect && t.running.Load() {
 				t.logInfo("control connection dropped, reconnecting", "proxy", t.proxyAddr)
 				t.reconnect()
-			} else {
-				t.logInfo("control connection dropped, closing", "proxy", t.proxyAddr)
-				t.Close()
+				// Loop back and pick up the new controlTCP installed by reconnect().
+				continue
 			}
+			t.logInfo("control connection dropped, closing", "proxy", t.proxyAddr)
+			t.Close()
 			return
 		}
 	}
@@ -480,7 +490,8 @@ func (t *Tunnel) reconnect() {
 
 		t.logInfo("reconnected successfully", "proxy", t.proxyAddr, "relay", t.relayAddr)
 		go t.readLoop()
-		go t.monitorControl()
+		// monitorControl is not re-spawned here — the existing goroutine
+		// loops back after reconnect() returns and picks up the new controlTCP.
 		return
 	}
 
