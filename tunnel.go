@@ -388,6 +388,11 @@ func (t *Tunnel) readLoop() {
 			case <-t.closeCh:
 				return
 			default:
+				// If remoteUDP was replaced by reconnect(), this readLoop is stale.
+				// The new readLoop will handle future packets; exit cleanly.
+				if t.remoteUDP.Load() != udp {
+					return
+				}
 				continue
 			}
 		}
@@ -465,9 +470,10 @@ func (t *Tunnel) monitorControl() {
 }
 
 // reconnect re-establishes the SOCKS5 session.
+// Uses explicit unlocks (not defer) so t.mu is free before calling t.Close()
+// on the exhausted path — calling Close() with t.mu held would deadlock.
 func (t *Tunnel) reconnect() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
 	if udp := t.remoteUDP.Load(); udp != nil {
 		udp.Close()
@@ -478,6 +484,7 @@ func (t *Tunnel) reconnect() {
 
 	for attempt := 0; attempt < 5; attempt++ {
 		if !t.running.Load() {
+			t.mu.Unlock()
 			return
 		}
 
@@ -492,9 +499,13 @@ func (t *Tunnel) reconnect() {
 		go t.readLoop()
 		// monitorControl is not re-spawned here — the existing goroutine
 		// loops back after reconnect() returns and picks up the new controlTCP.
+		t.mu.Unlock()
 		return
 	}
 
+	// All attempts exhausted. Release t.mu before calling Close() — Close()
+	// acquires t.mu, so holding it here would deadlock.
+	t.mu.Unlock()
 	t.logError("reconnect exhausted all attempts, tunnel shutting down", "proxy", t.proxyAddr)
-	t.running.Store(false)
+	t.Close()
 }
