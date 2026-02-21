@@ -99,20 +99,22 @@ func (c *tunnelConn) relayAppToProxy() {
 		// Lock-free atomic load instead of mutex
 		remoteUDP := c.tunnel.remoteUDP.Load()
 		if remoteUDP != nil {
-			remoteUDP.Write(sendBuf[:headerLen+n])
-			c.pktsSent.Add(1)
-			c.bytesSent.Add(uint64(n))
-			c.tunnel.pktsSent.Add(1)
-			c.tunnel.bytesSent.Add(uint64(n))
+			if _, werr := remoteUDP.Write(sendBuf[:headerLen+n]); werr == nil {
+				c.pktsSent.Add(1)
+				c.bytesSent.Add(uint64(n))
+				c.tunnel.pktsSent.Add(1)
+				c.tunnel.bytesSent.Add(uint64(n))
+			}
 		}
 	}
 }
 
 // deliverPacket sends a packet from the proxy to the app-facing socket.
 func (c *tunnelConn) deliverPacket(payload []byte) {
-	c.relayConn.WriteToUDP(payload, c.appAddr)
-	c.pktsRecv.Add(1)
-	c.bytesRecv.Add(uint64(len(payload)))
+	if _, err := c.relayConn.WriteToUDP(payload, c.appAddr); err == nil {
+		c.pktsRecv.Add(1)
+		c.bytesRecv.Add(uint64(len(payload)))
+	}
 }
 
 // PacketConn returns the app-facing UDPConn that the caller should use.
