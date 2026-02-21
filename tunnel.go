@@ -470,42 +470,59 @@ func (t *Tunnel) monitorControl() {
 }
 
 // reconnect re-establishes the SOCKS5 session.
-// Uses explicit unlocks (not defer) so t.mu is free before calling t.Close()
-// on the exhausted path — calling Close() with t.mu held would deadlock.
+// t.mu is held only around each connect() call (state mutations), never during
+// the backoff sleep — this lets Close() and monitorControl acquire t.mu
+// immediately rather than blocking for up to 31 seconds.
 func (t *Tunnel) reconnect() {
+	// Close old connections under lock, then release immediately.
 	t.mu.Lock()
-
 	if udp := t.remoteUDP.Load(); udp != nil {
 		udp.Close()
 	}
 	if t.controlTCP != nil {
 		t.controlTCP.Close()
 	}
+	t.mu.Unlock()
 
 	for attempt := 0; attempt < 5; attempt++ {
+		// Fast check without the lock before each attempt.
 		if !t.running.Load() {
-			t.mu.Unlock()
 			return
 		}
 
 		t.logInfo("reconnect attempt", "attempt", attempt+1, "proxy", t.proxyAddr)
-		if err := t.connect(); err != nil {
-			t.logError("reconnect failed", "attempt", attempt+1, "error", err)
-			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
-			continue
+
+		// Hold t.mu only for the duration of connect(), which writes
+		// controlTCP, relayAddr, and remoteUDP. Double-check running
+		// inside the lock to handle a Close() that raced the check above.
+		t.mu.Lock()
+		if !t.running.Load() {
+			t.mu.Unlock()
+			return
+		}
+		err := t.connect()
+		t.mu.Unlock()
+
+		if err == nil {
+			t.logInfo("reconnected successfully", "proxy", t.proxyAddr, "relay", t.relayAddr)
+			go t.readLoop()
+			// monitorControl is not re-spawned here — the existing goroutine
+			// loops back after reconnect() returns and picks up the new controlTCP.
+			return
 		}
 
-		t.logInfo("reconnected successfully", "proxy", t.proxyAddr, "relay", t.relayAddr)
-		go t.readLoop()
-		// monitorControl is not re-spawned here — the existing goroutine
-		// loops back after reconnect() returns and picks up the new controlTCP.
-		t.mu.Unlock()
-		return
+		t.logError("reconnect failed", "attempt", attempt+1, "error", err)
+
+		// Sleep without holding any lock so Close() can proceed immediately.
+		// Select on closeCh so we exit early if the tunnel shuts down mid-sleep.
+		select {
+		case <-t.closeCh:
+			return
+		case <-time.After(time.Duration(1<<uint(attempt)) * time.Second):
+		}
 	}
 
-	// All attempts exhausted. Release t.mu before calling Close() — Close()
-	// acquires t.mu, so holding it here would deadlock.
-	t.mu.Unlock()
 	t.logError("reconnect exhausted all attempts, tunnel shutting down", "proxy", t.proxyAddr)
+	// t.mu is free here — Close() can acquire it without deadlock.
 	t.Close()
 }
