@@ -37,23 +37,35 @@ func (m *Manager) AddTunnel(name, proxyURL string) (*Tunnel, error) {
 
 // AddTunnelContext is like AddTunnel but respects context cancellation.
 func (m *Manager) AddTunnelContext(ctx context.Context, name, proxyURL string) (*Tunnel, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.tunnels[name]; exists {
+	// Fast path: error immediately if the tunnel already exists.
+	m.mu.RLock()
+	_, exists := m.tunnels[name]
+	m.mu.RUnlock()
+	if exists {
 		return nil, fmt.Errorf("tunnel %q already exists", name)
 	}
 
+	// Create and connect outside the lock — ConnectContext does network IO
+	// (TCP dial + SOCKS5 handshake) that can take up to ConnectTimeout seconds.
 	tunnel, err := NewTunnel(proxyURL, m.config)
 	if err != nil {
 		return nil, err
 	}
-
 	if err := tunnel.ConnectContext(ctx); err != nil {
 		return nil, err
 	}
 
+	// Register under the write lock. Re-check in case a concurrent
+	// AddTunnelContext for the same name beat us here.
+	m.mu.Lock()
+	if _, exists := m.tunnels[name]; exists {
+		m.mu.Unlock()
+		tunnel.Close()
+		return nil, fmt.Errorf("tunnel %q already exists", name)
+	}
 	m.tunnels[name] = tunnel
+	m.mu.Unlock()
+
 	return tunnel, nil
 }
 
@@ -78,24 +90,36 @@ func (m *Manager) Dial(name, proxyURL, target string) (*Connection, error) {
 
 // DialContext is like Dial but respects context cancellation.
 func (m *Manager) DialContext(ctx context.Context, name, proxyURL, target string) (*Connection, error) {
-	m.mu.Lock()
+	// Fast path: tunnel already exists — just dial without any write lock.
+	m.mu.RLock()
 	tunnel, exists := m.tunnels[name]
-	if !exists {
-		var err error
-		tunnel, err = NewTunnel(proxyURL, m.config)
-		if err != nil {
-			m.mu.Unlock()
-			return nil, err
-		}
-		if err := tunnel.ConnectContext(ctx); err != nil {
-			m.mu.Unlock()
-			return nil, err
-		}
-		m.tunnels[name] = tunnel
+	m.mu.RUnlock()
+	if exists {
+		return tunnel.DialContext(ctx, target)
 	}
+
+	// Slow path: create and connect outside the lock — network IO should
+	// never hold the Manager write lock.
+	newTunnel, err := NewTunnel(proxyURL, m.config)
+	if err != nil {
+		return nil, err
+	}
+	if err := newTunnel.ConnectContext(ctx); err != nil {
+		return nil, err
+	}
+
+	// Register under the write lock. If a concurrent DialContext for the same
+	// name beat us here, discard ours and use theirs.
+	m.mu.Lock()
+	if existing, exists := m.tunnels[name]; exists {
+		m.mu.Unlock()
+		newTunnel.Close()
+		return existing.DialContext(ctx, target)
+	}
+	m.tunnels[name] = newTunnel
 	m.mu.Unlock()
 
-	return tunnel.DialContext(ctx, target)
+	return newTunnel.DialContext(ctx, target)
 }
 
 // RemoveTunnel stops and removes a named tunnel. All connections through
