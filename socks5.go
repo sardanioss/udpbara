@@ -65,6 +65,9 @@ func socks5UsernameAuth(conn net.Conn, user, pass string) error {
 	if _, err := io.ReadFull(conn, resp); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
+	if resp[0] != 0x01 {
+		return fmt.Errorf("invalid auth subnegotiation version: 0x%02x", resp[0])
+	}
 	if resp[1] != 0x00 {
 		return errors.New("authentication failed")
 	}
@@ -86,6 +89,12 @@ func socks5UDPAssociate(conn net.Conn) (*net.UDPAddr, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return nil, fmt.Errorf("read UDP ASSOCIATE response: %w", err)
+	}
+	if header[0] != 0x05 {
+		return nil, fmt.Errorf("invalid SOCKS5 version in response: 0x%02x", header[0])
+	}
+	if header[2] != 0x00 {
+		return nil, fmt.Errorf("non-zero RSV byte in response: 0x%02x", header[2])
 	}
 	if header[1] != 0x00 {
 		return nil, fmt.Errorf("UDP ASSOCIATE rejected: reply=0x%02x", header[1])
