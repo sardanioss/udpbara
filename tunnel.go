@@ -36,6 +36,7 @@ type Tunnel struct {
 	allConns []*tunnelConn
 
 	running  atomic.Bool
+	closing  atomic.Bool // set by Close(); prevents ConnectContext from opening after Close()
 	closeCh  chan struct{}
 
 	// Logger (nil = no logging)
@@ -164,11 +165,15 @@ func (t *Tunnel) Connect() error {
 // Returns context.DeadlineExceeded or context.Canceled if the context expires
 // before the connection is established.
 func (t *Tunnel) ConnectContext(ctx context.Context) error {
-	// Check under lock first — fast path if already connected.
+	// Check under lock first — fast path if already connected or already closed.
 	t.mu.Lock()
 	if t.running.Load() {
 		t.mu.Unlock()
 		return nil
+	}
+	if t.closing.Load() {
+		t.mu.Unlock()
+		return fmt.Errorf("tunnel closed")
 	}
 	if err := ctx.Err(); err != nil {
 		t.mu.Unlock()
@@ -185,13 +190,16 @@ func (t *Tunnel) ConnectContext(ctx context.Context) error {
 		return err
 	}
 
-	// Store results under lock. Re-check running in case a concurrent
-	// ConnectContext beat us here.
+	// Store results under lock. Re-check running (another ConnectContext beat us)
+	// and closing (Close() was called while we were doing IO).
 	t.mu.Lock()
-	if t.running.Load() {
+	if t.running.Load() || t.closing.Load() {
 		t.mu.Unlock()
 		ctrl.Close()
 		remoteUDP.Close()
+		if t.closing.Load() {
+			return fmt.Errorf("tunnel closed")
+		}
 		return nil
 	}
 	t.controlTCP = ctrl
@@ -338,6 +346,9 @@ func (t *Tunnel) Stats() TunnelStats {
 
 // Close shuts down the tunnel and all connections.
 func (t *Tunnel) Close() error {
+	// Set closing first so ConnectContext() sees it even when running is still false
+	// (i.e., when Close() races with an in-progress ConnectContext() IO phase).
+	t.closing.Store(true)
 	if !t.running.CompareAndSwap(true, false) {
 		return nil
 	}
