@@ -149,7 +149,7 @@ func socks5UDPAssociate(conn net.Conn) (*net.UDPAddr, error) {
 
 // buildSOCKS5UDPHeader constructs the SOCKS5 UDP request header (no payload).
 // ATYP=0x03 (hostname) is used to preserve the hostname for proxy auth.
-// Panics if hostname exceeds 255 bytes (SOCKS5 protocol limit).
+// Callers must ensure targetHost does not exceed 255 bytes.
 func buildSOCKS5UDPHeader(targetHost string, targetPort int) []byte {
 	var hdr []byte
 	hdr = append(hdr, 0x00, 0x00) // RSV
@@ -180,6 +180,12 @@ func buildSOCKS5UDPHeader(targetHost string, targetPort int) []byte {
 func parseSOCKS5UDPPacket(data []byte) (payload []byte, sourceHost string, sourcePort int, err error) {
 	if len(data) < 7 {
 		return nil, "", 0, errors.New("packet too short")
+	}
+
+	// data[2] is FRAG: non-zero means this is a fragment requiring reassembly.
+	// We do not implement UDP fragmentation reassembly; drop such packets.
+	if data[2] != 0x00 {
+		return nil, "", 0, fmt.Errorf("fragmented SOCKS5 UDP packet (FRAG=0x%02x) not supported", data[2])
 	}
 
 	offset := 3 // skip RSV(2) + FRAG(1)

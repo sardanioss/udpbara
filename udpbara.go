@@ -20,7 +20,9 @@ package udpbara
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 )
 
 // Logger is an optional logging interface for tunnel events.
@@ -98,6 +100,17 @@ func ParseProxyURL(proxyURL string) (addr, user, pass string, err error) {
 	}
 	if u.Host == "" {
 		return "", "", "", fmt.Errorf("missing proxy host")
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		return "", "", "", fmt.Errorf("proxy URL must include a port (e.g. socks5://host:1080): %w", err)
+	}
+	if host == "" {
+		return "", "", "", fmt.Errorf("missing proxy host")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "", "", "", fmt.Errorf("invalid proxy port %q: must be 1–65535", portStr)
 	}
 	addr = u.Host
 	if u.User != nil {
