@@ -482,13 +482,16 @@ func (t *Tunnel) monitorControl() {
 // the backoff sleep — this lets Close() and monitorControl acquire t.mu
 // immediately rather than blocking for up to 31 seconds.
 func (t *Tunnel) reconnect() {
-	// Close old connections under lock, then release immediately.
+	// Close old connections under lock and nil the fields to prevent double-close
+	// if Close() is called after all reconnect attempts fail.
 	t.mu.Lock()
 	if udp := t.remoteUDP.Load(); udp != nil {
 		udp.Close()
+		t.remoteUDP.Store(nil)
 	}
 	if t.controlTCP != nil {
 		t.controlTCP.Close()
+		t.controlTCP = nil
 	}
 	t.mu.Unlock()
 
